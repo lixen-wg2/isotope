@@ -1,0 +1,16 @@
+%%%-------------------------------------------------------------------
+%%% @doc Demo application for Isotope TUI framework.
+%%% @end
+%%%-------------------------------------------------------------------
+-module(demo_app).
+
+-behaviour(application).
+
+-export([start/2, stop/1]).
+
+start(_StartType, _StartArgs) ->
+    demo_sup:start_link().
+
+stop(_State) ->
+    ok.
+
