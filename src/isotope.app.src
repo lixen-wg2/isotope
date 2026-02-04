@@ -1,0 +1,14 @@
+{application, isotope, [
+    {description, "Isotope TUI Framework - Nitrogen-inspired terminal UI for Erlang"},
+    {vsn, "0.1.0"},
+    {registered, [iso_sup, iso_tty, iso_input]},
+    {mod, {isotope_app, []}},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/synrc/isotope"}]}
+ ]}.

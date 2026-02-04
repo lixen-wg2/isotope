@@ -1,0 +1,15 @@
+{application, demo, [
+    {description, "Isotope Demo Application"},
+    {vsn, "0.1.0"},
+    {registered, [demo_server]},
+    {mod, {demo_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        isotope
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]}
+]}.
+
