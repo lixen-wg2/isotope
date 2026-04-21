@@ -16,5 +16,6 @@ cleanup() {
 # Set trap to run cleanup on exit (catches Ctrl+C, etc.)
 trap cleanup EXIT
 
-rebar3 compile && erl -noshell -pa _build/default/lib/*/ebin -pa _build/default/checkouts/*/ebin -eval "application:ensure_all_started(demo)" -eval "receive stop -> ok end"
-
+# Use -noinput instead of -noshell to keep TTY available for the TUI
+# -noshell detaches from the TTY, but -noinput just disables the Erlang shell
+rebar3 compile && erl -noinput -pa _build/default/lib/*/ebin -pa _build/default/checkouts/*/ebin -eval "application:ensure_all_started(demo), UiPid = whereis(demo_ui), Ref = erlang:monitor(process, UiPid), receive {'DOWN', Ref, process, _, _} -> ok end"

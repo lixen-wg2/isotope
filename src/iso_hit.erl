@@ -12,7 +12,9 @@
 -spec find_at(term(), integer(), integer(), #bounds{}) ->
     {tab, term(), term()} | {button, term()} | {input, term()} |
     {box, term()} | {tabs_container, term()} | {table, term()} |
-    {table_row, term(), integer()} | not_found.
+    {table_header, term(), term()} | {table_row, term(), integer()} | {list, term()} |
+    {tree, term()} | {tree_node, term(), term()} | {status_bar_item, binary() | string()} |
+    {list_item, term(), integer()} | not_found.
 find_at(Tree, Col, Row, Bounds) ->
     find_at_impl(Tree, Col, Row, Bounds).
 
@@ -93,34 +95,55 @@ find_at_impl(#box{id = Id, children = Children, x = X, y = Y, width = W, height 
         Found -> Found
     end;
 
-find_at_impl(#vbox{children = Children, x = X, y = Y}, Col, Row, Bounds) ->
+find_at_impl(#vbox{children = Children, spacing = Spacing, x = X, y = Y}, Col, Row, Bounds) ->
     ChildBounds = Bounds#bounds{x = Bounds#bounds.x + X, y = Bounds#bounds.y + Y},
-    find_in_children_vbox(Children, Col, Row, ChildBounds);
+    ChildHeights = iso_layout:calculate_vbox_heights(Children, Bounds, Spacing, Y),
+    find_in_children_vbox(lists:zip(Children, ChildHeights), Col, Row, ChildBounds, Spacing);
 
 find_at_impl(#hbox{children = Children, spacing = Spacing, x = X, y = Y}, Col, Row, Bounds) ->
     StartBounds = Bounds#bounds{x = Bounds#bounds.x + X, y = Bounds#bounds.y + Y},
-    %% Calculate remaining width for auto-sized children (same as render)
-    TotalSpacing = max(0, (length(Children) - 1) * Spacing),
-    FixedWidth = lists:sum([case element_fixed_width(C) of auto -> 0; W -> W end || C <- Children]),
-    RemainingWidth = max(0, StartBounds#bounds.width - FixedWidth - TotalSpacing),
-    find_in_children_hbox(Children, Col, Row, StartBounds, Spacing, RemainingWidth);
+    ChildWidths = iso_layout:calculate_hbox_widths(Children, Bounds, Spacing, X),
+    find_in_children_hbox(lists:zip(Children, ChildWidths), Col, Row, StartBounds, Spacing);
 
 find_at_impl(#table{id = Id, x = X, y = Y, width = W, height = H, border = Border,
-                    show_header = ShowHeader, scroll_offset = ScrollOffset, rows = Rows}, Col, Row, Bounds) ->
+                    show_header = ShowHeader, scroll_offset = ScrollOffset,
+                    columns = Columns, rows = Rows, total_rows = TotalRows,
+                    row_provider = RowProvider} = Table, Col, Row, Bounds) ->
     ActualX = Bounds#bounds.x + X,
     ActualY = Bounds#bounds.y + Y,
     Width = case W of auto -> Bounds#bounds.width - X; _ -> W end,
-    Height = case H of auto -> min(length(Rows) + 3, Bounds#bounds.height - Y); _ -> H end,
+    ActualTotalRows = case TotalRows of
+        undefined -> length(Rows);
+        N -> N
+    end,
+    Overhead = table_overhead(Border, ShowHeader),
+    Height = case H of
+        auto -> min(ActualTotalRows + Overhead, Bounds#bounds.height - Y);
+        fill -> max(Overhead + 1, Bounds#bounds.height - Y);
+        _ -> H
+    end,
     BorderOffset = case Border of none -> 0; _ -> 1 end,
     HeaderOffset = case ShowHeader of true -> 2; false -> 0 end,
+    VisibleHeight = max(0, Height - 2 * BorderOffset - HeaderOffset),
+    VisibleRows = visible_table_rows(RowProvider, Rows, ScrollOffset, VisibleHeight),
+    ColWidths = calculate_column_widths(iso_el_table:header_values(Table), Columns, VisibleRows,
+                                        Width - 2 * BorderOffset),
+    HeaderRow = ActualY + BorderOffset + 1,
     %% Check if click is within table bounds
     if
+        ShowHeader =:= true,
+        Col >= ActualX + BorderOffset + 1, Col =< ActualX + Width - BorderOffset,
+        Row =:= HeaderRow ->
+            case find_clicked_table_column(Columns, ColWidths, Col - ActualX - BorderOffset) of
+                {ok, ColumnId} -> {table_header, Id, ColumnId};
+                not_found -> {table, Id}
+            end;
         Col >= ActualX + BorderOffset, Col =< ActualX + Width - BorderOffset,
         Row > ActualY + BorderOffset + HeaderOffset, Row =< ActualY + Height - BorderOffset ->
             %% Calculate which row was clicked
             ClickedRowIdx = Row - ActualY - BorderOffset - HeaderOffset + ScrollOffset,
             if
-                ClickedRowIdx >= 1, ClickedRowIdx =< length(Rows) ->
+                ClickedRowIdx >= 1, ClickedRowIdx =< ActualTotalRows ->
                     {table_row, Id, ClickedRowIdx};
                 true ->
                     {table, Id}
@@ -128,6 +151,104 @@ find_at_impl(#table{id = Id, x = X, y = Y, width = W, height = H, border = Borde
         Col >= ActualX, Col =< ActualX + Width,
         Row >= ActualY, Row =< ActualY + Height ->
             {table, Id};
+        true ->
+            not_found
+    end;
+
+find_at_impl(#list{id = Id, x = X, y = Y, height = H, items = Items, offset = Offset}, Col, Row, Bounds) ->
+    ActualX = Bounds#bounds.x + X,
+    ActualY = Bounds#bounds.y + Y,
+    Height = case H of auto -> min(length(Items), Bounds#bounds.height - Y); _ -> H end,
+    Width = Bounds#bounds.width - X,
+    if
+        Col >= ActualX + 1, Col =< ActualX + Width,
+        Row > ActualY, Row =< ActualY + Height ->
+            %% Calculate which item was clicked
+            ClickedIdx = Row - ActualY - 1 + Offset,
+            if
+                ClickedIdx >= 0, ClickedIdx < length(Items) ->
+                    {list_item, Id, ClickedIdx};
+                true ->
+                    {list, Id}
+            end;
+        true ->
+            not_found
+    end;
+
+find_at_impl(#tree{id = Id, x = X, y = Y, width = W} = Tree, Col, Row, Bounds) ->
+    ActualX = Bounds#bounds.x + X,
+    ActualY = Bounds#bounds.y + Y,
+    Width = case W of auto -> Bounds#bounds.width - X; _ -> W end,
+    Height = iso_tree_nav:resolved_height(Tree, Bounds),
+    if
+        Col >= ActualX + 1, Col =< ActualX + Width,
+        Row > ActualY, Row =< ActualY + Height ->
+            case iso_tree_nav:row_node(Tree, Bounds, Row - ActualY) of
+                {ok, NodeId} -> {tree_node, Id, NodeId};
+                not_found -> {tree, Id}
+            end;
+        true ->
+            not_found
+    end;
+
+find_at_impl(#status_bar{} = StatusBar, Col, Row, Bounds) ->
+    case iso_el_status_bar:item_at(StatusBar, Col, Row, Bounds) of
+        {ok, Key} -> {status_bar_item, Key};
+        not_found -> not_found
+    end;
+
+find_at_impl(#scroll{children = Children, x = X, y = Y, width = W, height = H,
+                     offset = Offset, show_scrollbar = ShowBar}, Col, Row, Bounds) ->
+    ActualX = Bounds#bounds.x + X,
+    ActualY = Bounds#bounds.y + Y,
+    Width = case W of
+        auto -> Bounds#bounds.width - X;
+        _ -> W
+    end,
+    Height = case H of
+        auto -> Bounds#bounds.height - Y;
+        fill -> Bounds#bounds.height - Y;
+        _ -> H
+    end,
+    case Col >= ActualX + 1 andalso Col =< ActualX + Width andalso
+         Row >= ActualY + 1 andalso Row =< ActualY + Height of
+        false ->
+            not_found;
+        true ->
+            ScrollBounds = #bounds{x = ActualX, y = ActualY, width = Width, height = Height},
+            TotalHeight = lists:sum([iso_element:height(Child, ScrollBounds) || Child <- Children]),
+            ContentWidth = case ShowBar andalso TotalHeight > Height of
+                true -> max(1, Width - 1);
+                false -> Width
+            end,
+            ClampedOffset = min(max(0, Offset), max(0, TotalHeight - Height)),
+            ContentHeight = max(Height, TotalHeight),
+            ContentBounds = #bounds{x = ActualX, y = ActualY - ClampedOffset,
+                                    width = ContentWidth, height = ContentHeight},
+            ChildHeights = iso_layout:calculate_vbox_heights(Children, ContentBounds, 0),
+            find_in_children_vbox(lists:zip(Children, ChildHeights), Col, Row, ContentBounds, 0)
+    end;
+
+find_at_impl(#modal{children = Children, width = W, height = H}, Col, Row, Bounds) ->
+    %% Modal is centered - calculate actual position (same as in iso_render)
+    Width = case W of
+        auto -> min(60, Bounds#bounds.width - 4);
+        _ -> min(W, Bounds#bounds.width - 2)
+    end,
+    Height = case H of
+        auto -> min(10, Bounds#bounds.height - 4);
+        _ -> min(H, Bounds#bounds.height - 2)
+    end,
+    ModalX = (Bounds#bounds.width - Width) div 2,
+    ModalY = (Bounds#bounds.height - Height) div 2,
+    %% Check if click is inside modal bounds
+    if
+        Col >= ModalX + 1, Col =< ModalX + Width,
+        Row >= ModalY + 1, Row =< ModalY + Height ->
+            %% Inside modal - check children with adjusted bounds
+            ChildBounds = #bounds{x = ModalX + 1, y = ModalY + 1,
+                                  width = max(1, Width - 2), height = max(1, Height - 2)},
+            find_in_children(Children, Col, Row, ChildBounds);
         true ->
             not_found
     end;
@@ -158,43 +279,87 @@ find_tab_content([#tab{id = Id, content = Content} | _], Id) -> {ok, Content};
 find_tab_content([_ | Rest], ActiveTab) -> find_tab_content(Rest, ActiveTab).
 
 %% Find in hbox children with proper width calculation
-find_in_children_hbox([], _, _, _, _, _) -> not_found;
-find_in_children_hbox([Child | Rest], Col, Row, Bounds, Spacing, RemainingWidth) ->
-    ChildWidth = case element_fixed_width(Child) of
-        auto -> RemainingWidth;
-        W -> W
-    end,
+find_in_children_hbox([], _, _, _, _) -> not_found;
+find_in_children_hbox([{Child, ChildWidth} | Rest], Col, Row, Bounds, Spacing) ->
     ChildBounds = Bounds#bounds{width = ChildWidth},
     case find_at_impl(Child, Col, Row, ChildBounds) of
         not_found ->
             NextBounds = Bounds#bounds{x = Bounds#bounds.x + ChildWidth + Spacing},
-            find_in_children_hbox(Rest, Col, Row, NextBounds, Spacing, RemainingWidth);
+            find_in_children_hbox(Rest, Col, Row, NextBounds, Spacing);
         Found -> Found
     end.
 
-%% Find in vbox children with proper y offset
-find_in_children_vbox([], _, _, _) -> not_found;
-find_in_children_vbox([Child | Rest], Col, Row, Bounds) ->
-    ChildHeight = element_height(Child),
-    case find_at_impl(Child, Col, Row, Bounds) of
+%% Find in vbox children with the same resolved heights as rendering.
+find_in_children_vbox([], _, _, _, _) -> not_found;
+find_in_children_vbox([{Child, ChildHeight} | Rest], Col, Row, Bounds, Spacing) ->
+    ChildBounds = Bounds#bounds{height = ChildHeight},
+    case find_at_impl(Child, Col, Row, ChildBounds) of
         not_found ->
-            NextBounds = Bounds#bounds{y = Bounds#bounds.y + ChildHeight},
-            find_in_children_vbox(Rest, Col, Row, NextBounds);
+            NextBounds = Bounds#bounds{y = Bounds#bounds.y + ChildHeight + Spacing},
+            find_in_children_vbox(Rest, Col, Row, NextBounds, Spacing);
         Found -> Found
     end.
 
-%% Returns the fixed width of an element, or 'auto' if it should fill remaining space
-element_fixed_width(#box{width = W}) -> W;
-element_fixed_width(#tabs{width = W}) -> W;
-element_fixed_width(#table{width = W}) -> W;
-element_fixed_width(#text{content = C}) -> byte_size(iolist_to_binary([C]));
-element_fixed_width(#button{width = auto, label = L}) -> byte_size(iolist_to_binary([L])) + 4;
-element_fixed_width(#button{width = W}) -> W;
-element_fixed_width(#input{width = auto}) -> 22;
-element_fixed_width(#input{width = W}) -> W;
-element_fixed_width(_) -> auto.
+table_overhead(Border, ShowHeader) ->
+    BorderOffset = case Border of none -> 0; _ -> 1 end,
+    HeaderOffset = case ShowHeader of true -> 2; false -> 0 end,
+    2 * BorderOffset + HeaderOffset.
 
-element_height(#text{}) -> 1;
-element_height(#button{}) -> 1;
-element_height(#input{}) -> 1;
-element_height(_) -> 1.
+visible_table_rows(undefined, Rows, ScrollOffset, VisibleHeight) ->
+    lists:sublist(
+        lists:nthtail(min(ScrollOffset, max(0, length(Rows) - 1)), Rows),
+        max(0, VisibleHeight)
+    );
+visible_table_rows(Provider, _Rows, ScrollOffset, VisibleHeight) when is_function(Provider, 2) ->
+    Provider(ScrollOffset, VisibleHeight).
+
+calculate_column_widths(Headers, Columns, Rows, AvailableWidth) ->
+    NumCols = length(Columns),
+    ContentWidths = lists:map(
+        fun({Idx, {Col, Header}}) ->
+            HeaderLen = string:length(to_string(Header)),
+            MaxDataLen = lists:foldl(
+                fun(Row, Max) ->
+                    CellData = safe_nth(Idx, Row, <<>>),
+                    max(Max, string:length(to_string(CellData)))
+                end, 0, Rows),
+            case Col#table_col.width of
+                auto -> max(HeaderLen, MaxDataLen);
+                W -> W
+            end
+        end,
+        lists:zip(lists:seq(1, NumCols), lists:zip(Columns, Headers))),
+    TotalWidth = lists:sum(ContentWidths) + NumCols - 1,
+    if
+        TotalWidth =< AvailableWidth -> ContentWidths;
+        true ->
+            Scale = AvailableWidth / max(1, TotalWidth),
+            [max(3, round(W * Scale)) || W <- ContentWidths]
+    end.
+
+find_clicked_table_column([], [], _ClickCol) ->
+    not_found;
+find_clicked_table_column([#table_col{id = Id}], [Width], ClickCol) ->
+    if
+        ClickCol >= 1, ClickCol =< Width -> {ok, Id};
+        true -> not_found
+    end;
+find_clicked_table_column([#table_col{id = Id} | Rest], [Width | RestWidths], ClickCol) ->
+    if
+        ClickCol >= 1, ClickCol =< Width + 1 ->
+            {ok, Id};
+        true ->
+            find_clicked_table_column(Rest, RestWidths, ClickCol - Width - 1)
+    end.
+
+to_string(Bin) when is_binary(Bin) -> unicode:characters_to_list(Bin);
+to_string(List) when is_list(List) -> List;
+to_string(Atom) when is_atom(Atom) -> atom_to_list(Atom);
+to_string(Int) when is_integer(Int) -> integer_to_list(Int);
+to_string(Float) when is_float(Float) -> float_to_list(Float, [{decimals, 2}]);
+to_string(Other) -> io_lib:format("~p", [Other]).
+
+safe_nth(N, List, _Default) when N > 0, N =< length(List) ->
+    lists:nth(N, List);
+safe_nth(_, _, Default) ->
+    Default.

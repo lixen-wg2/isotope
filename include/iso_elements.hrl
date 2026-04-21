@@ -16,16 +16,18 @@
 %%====================================================================
 
 %% Common fields for all elements - use this macro in element records
--define(ELEMENT_BASE, 
+-define(ELEMENT_BASE,
     id = undefined :: term(),           %% Unique identifier
-    module :: module(),                 %% Callback module for rendering
     x = 0 :: non_neg_integer(),         %% X position (column, 0-based)
     y = 0 :: non_neg_integer(),         %% Y position (row, 0-based)
     width = auto :: auto | pos_integer(),   %% Width (auto = fit content)
-    height = auto :: auto | pos_integer(),  %% Height (auto = fit content)
+    height = auto :: auto | fill | pos_integer(),  %% Height (auto = fit content, fill = flex)
     style = #{} :: map(),               %% Style properties (fg, bg, bold, etc.)
     visible = true :: boolean(),        %% Whether to render
-    focusable = false :: boolean()      %% Can receive focus
+    focusable = false :: boolean(),     %% Can receive focus
+    %% Lifecycle hooks
+    on_mount = undefined :: undefined | fun((Element :: tuple()) -> ok),
+    on_unmount = undefined :: undefined | fun((Element :: tuple()) -> ok)
 ).
 
 %%====================================================================
@@ -120,16 +122,27 @@
 }).
 
 %% Table element - displays tabular data with optional selection
+%% Supports two modes:
+%% 1. Static mode: rows contains all data (default)
+%% 2. Virtual scrolling mode: row_provider fetches rows on demand
 -record(table, {
     ?ELEMENT_BASE,
     columns = [] :: [#table_col{}],        %% Column definitions
-    rows = [] :: [[term()]],               %% Row data (list of lists)
-    selected_row = 0 :: non_neg_integer(), %% Currently selected row (0 = none)
+    rows = [] :: [[term()]],               %% Row data (list of lists) - used in static mode
+    selected_row = 0 :: non_neg_integer(), %% Currently selected row (0 = none, 1-based)
     scroll_offset = 0 :: non_neg_integer(),%% Vertical scroll offset
+    activate_on_reclick = false :: boolean(), %% Re-click selected row to activate it
+    sortable = false :: boolean(),         %% Clickable headers auto-sort static rows
+    sort_by = undefined :: undefined | term(), %% Currently sorted column ID
+    sort_dir = asc :: asc | desc,          %% Current sort direction
     border = none :: none | single | double,  %% Default to no border
     show_header = true :: boolean(),       %% Show column headers
     zebra = true :: boolean(),             %% Alternate row colors (default on)
-    on_select = undefined :: undefined | {atom(), atom()} | fun()
+    on_select = undefined :: undefined | {atom(), atom()} | fun(),
+    %% Virtual scrolling fields
+    total_rows = undefined :: undefined | non_neg_integer(),  %% Total row count (for virtual scrolling)
+    row_provider = undefined :: undefined | fun((StartIdx :: non_neg_integer(), Count :: pos_integer()) -> [[term()]])
+    %% row_provider is called with 0-based start index and count, returns list of rows
 }).
 
 %% Tab definition for tabs widget
@@ -146,6 +159,108 @@
     active_tab = undefined :: term(),      %% ID of currently active tab
     tab_style = top :: top | bottom,       %% Tab bar position
     on_change = undefined :: undefined | {atom(), atom()} | fun()
+}).
+
+%%====================================================================
+%% Observer-style Elements
+%%====================================================================
+
+%% Progress bar / gauge - shows value/max with visual bar
+-record(progress_bar, {
+    ?ELEMENT_BASE,
+    value = 0 :: number(),                 %% Current value
+    max = 100 :: number(),                 %% Maximum value
+    show_percent = true :: boolean(),      %% Show percentage text
+    show_value = false :: boolean(),       %% Show value/max text
+    bar_char = $# :: char(),               %% Character for filled portion
+    empty_char = $- :: char(),             %% Character for empty portion
+    color = auto :: auto | atom(),         %% Bar color (auto = threshold-based)
+    threshold_warn = 0.70 :: float(),      %% Yellow threshold (0.0-1.0)
+    threshold_crit = 0.85 :: float()       %% Red threshold (0.0-1.0)
+}).
+
+%% Sparkline - mini chart showing trend over time
+-record(sparkline, {
+    ?ELEMENT_BASE,
+    values = [] :: [number()],             %% List of values (newest last)
+    min_val = auto :: auto | number(),     %% Minimum value for scaling
+    max_val = auto :: auto | number(),     %% Maximum value for scaling
+    style_type = braille :: braille | block | ascii,  %% Rendering style
+    color = cyan :: atom()                 %% Line color
+}).
+
+%% Stat row - horizontal row of key-value pairs
+-record(stat_row, {
+    ?ELEMENT_BASE,
+    items = [] :: [{Label :: binary(), Value :: binary()}],
+    separator = <<" | ">> :: binary(),     %% Separator between items
+    label_style = #{} :: map(),            %% Style for labels
+    value_style = #{bold => true} :: map() %% Style for values
+}).
+
+%% Status bar - bottom bar with keyboard shortcuts
+-record(status_bar, {
+    ?ELEMENT_BASE,
+    items = [] :: [{Key :: binary(), Label :: binary()}],
+    separator = <<" ">> :: binary(),       %% Separator between items
+    key_style = #{bold => true, fg => cyan} :: map(),
+    label_style = #{} :: map()
+}).
+
+%% Spacer - fills remaining vertical space in a vbox
+%% Use this to push elements (like status_bar) to the bottom
+-record(spacer, {
+    ?ELEMENT_BASE,
+    min_height = 0 :: non_neg_integer()   %% Minimum height (0 = fully flexible)
+}).
+
+%% Header bar - top bar with title and info
+-record(header, {
+    ?ELEMENT_BASE,
+    title = <<>> :: binary(),              %% Main title
+    subtitle = <<>> :: binary(),           %% Subtitle (e.g., node name)
+    items = [] :: [{Label :: binary(), Value :: binary()}],  %% Right-side items
+    bg_color = blue :: atom(),             %% Background color
+    fg_color = white :: atom()             %% Foreground color
+}).
+
+%% Tree node for tree view
+-record(tree_node, {
+    id :: term(),                          %% Node identifier
+    label = <<>> :: binary() | string(),   %% Node label
+    children = [] :: [#tree_node{}],       %% Child nodes
+    expanded = true :: boolean(),          %% Whether children are visible
+    icon = undefined :: undefined | binary() | string()  %% Optional icon/prefix
+}).
+
+%% Tree view - hierarchical tree display
+-record(tree, {
+    ?ELEMENT_BASE,
+    nodes = [] :: [#tree_node{}],          %% Root nodes
+    selected = undefined :: term(),        %% Selected node ID
+    offset = 0 :: non_neg_integer(),       %% Scroll offset for clipped trees
+    indent = 2 :: pos_integer(),           %% Indentation per level
+    show_lines = true :: boolean(),        %% Show tree lines (├─, └─, │)
+    on_select = undefined :: undefined | {atom(), atom()} | fun()
+}).
+
+%% Scroll container - scrollable viewport for content
+-record(scroll, {
+    ?ELEMENT_BASE,
+    children = [] :: [tuple()],            %% Child elements to scroll
+    offset = 0 :: non_neg_integer(),       %% Current scroll offset (lines from top)
+    show_scrollbar = true :: boolean()     %% Show scrollbar indicator
+}).
+
+%% List - selectable list of items
+-record(list, {
+    ?ELEMENT_BASE,
+    items = [] :: [binary() | {term(), binary()}],  %% Items: binary or {Id, Label}
+    selected = 0 :: non_neg_integer(),     %% Selected index (0-based)
+    offset = 0 :: non_neg_integer(),       %% Scroll offset for long lists
+    item_style = #{} :: map(),             %% Style for normal items
+    selected_style = #{bg => blue, fg => white} :: map(),  %% Style for selected item
+    on_select = undefined :: undefined | {atom(), atom()} | fun()
 }).
 
 %%====================================================================
@@ -179,4 +294,3 @@
 -define(UNDERLINE, #{underline => true}).
 
 -endif. %% ISO_ELEMENTS_HRL
-

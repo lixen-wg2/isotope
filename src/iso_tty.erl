@@ -18,13 +18,15 @@
 %% API
 -export([start_link/0, stop/0, cleanup/0]).
 -export([write/1, clear/0, get_size/0]).
+-export([set_resize_target/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
     tty_state :: prim_tty:state() | undefined,
-    reader_ref :: reference() | undefined
+    reader_ref :: reference() | undefined,
+    resize_target :: pid() | undefined  %% Process to notify on resize
 }).
 
 %% ANSI escape sequences
@@ -59,7 +61,8 @@ cleanup() ->
 %% @doc Write raw data to the terminal.
 -spec write(iodata()) -> ok.
 write(Data) ->
-    gen_server:call(?MODULE, {write, Data}).
+    gen_server:cast(?MODULE, {write, Data}),
+    ok.
 
 %% @doc Clear the screen.
 -spec clear() -> ok.
@@ -71,6 +74,12 @@ clear() ->
 get_size() ->
     gen_server:call(?MODULE, get_size).
 
+%% @doc Set the process to notify on terminal resize.
+%% The target will receive {resize, Cols, Rows} messages.
+-spec set_resize_target(pid()) -> ok.
+set_resize_target(Pid) ->
+    gen_server:cast(?MODULE, {set_resize_target, Pid}).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -81,6 +90,15 @@ init([]) ->
         {ok, TtyState} ->
             %% Get the reader reference from prim_tty handles
             #{read := ReaderRef} = prim_tty:handles(TtyState),
+            %% Register signal handler for SIGWINCH (terminal resize)
+            case os:type() of
+                {unix, _} ->
+                    ok = gen_event:add_handler(
+                           erl_signal_server, iso_sighandler,
+                           #{parent => self()});
+                _ ->
+                    ok
+            end,
             %% Enter alternate screen, hide cursor, enable mouse
             do_write(TtyState, [?ENTER_ALT_SCREEN, ?HIDE_CURSOR, ?ENABLE_MOUSE, ?CLEAR_SCREEN]),
             %% Start reading input
@@ -89,10 +107,6 @@ init([]) ->
         {error, Reason} ->
             {stop, Reason}
     end.
-
-handle_call({write, Data}, _From, State = #state{tty_state = TtyState}) ->
-    do_write(TtyState, Data),
-    {reply, ok, State};
 
 handle_call(get_size, _From, State = #state{tty_state = TtyState}) ->
     Result = prim_tty:window_size(TtyState),
@@ -105,8 +119,29 @@ handle_call(cleanup, _From, State = #state{tty_state = TtyState}) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
+handle_cast({set_resize_target, Pid}, State) ->
+    {noreply, State#state{resize_target = Pid}};
+handle_cast({write, Data}, State = #state{tty_state = TtyState}) ->
+    do_write(TtyState, Data),
+    {noreply, State};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+%% Handle SIGWINCH signal - terminal was resized
+handle_info({signal, sigwinch}, State = #state{tty_state = TtyState, resize_target = Target}) ->
+    case Target of
+        undefined ->
+            {noreply, State};
+        Pid when is_pid(Pid) ->
+            case prim_tty:window_size(TtyState) of
+                {ok, {Cols, Rows}} ->
+                    Pid ! {resize, Cols, Rows};
+                _ ->
+                    ok
+            end,
+            {noreply, State}
+    end;
 
 %% Handle input data from prim_tty reader - forward to iso_input
 handle_info({ReaderRef, {data, Data}}, State = #state{reader_ref = ReaderRef, tty_state = TtyState}) ->
@@ -123,10 +158,16 @@ handle_info({ReaderRef, eof}, State = #state{reader_ref = ReaderRef}) ->
 handle_info({'EXIT', _Pid, _Reason}, State) ->
     {noreply, State};
 
+%% Handle raw sigwinch atom (delivered by BEAM runtime in some OTP versions)
+handle_info(sigwinch, State) ->
+    handle_info({signal, sigwinch}, State);
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, #state{tty_state = TtyState}) ->
+    %% Remove signal handler
+    catch gen_event:delete_handler(erl_signal_server, iso_sighandler, []),
     cleanup_tty(TtyState),
     ok.
 
@@ -146,8 +187,7 @@ init_tty() ->
     end.
 
 do_write(_TtyState, Data) ->
-    %% Use io:format with ~ts to properly handle UTF-8 unicode
-    io:format(user, "~ts", [iolist_to_binary(Data)]).
+    io:put_chars(user, Data).
 
 cleanup_tty(undefined) ->
     ok;
@@ -159,4 +199,3 @@ cleanup_tty(TtyState) ->
         ?SHOW_CURSOR,
         ?EXIT_ALT_SCREEN
     ]).
-

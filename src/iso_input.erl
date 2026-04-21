@@ -8,6 +8,7 @@
 %%% - {key, up | down | left | right | home | 'end' | page_up | page_down}
 %%% - {char, Char} - Regular character
 %%% - {ctrl, Char} - Control key (e.g., {ctrl, $c})
+%%% - {mouse, scroll, up | down | left | right, Col, Row}
 %%% - enter, tab, backspace, escape, delete
 %%% @end
 %%%-------------------------------------------------------------------
@@ -108,6 +109,20 @@ parse_input(<<"\e[6~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, page_down
 parse_input(<<"\e[3~", Rest/binary>>, Acc) -> parse_input(Rest, [delete | Acc]);
 parse_input(<<"\e[Z", Rest/binary>>, Acc) -> parse_input(Rest, [{key, btab} | Acc]);  %% Shift+Tab
 
+%% Function keys (F1-F12)
+parse_input(<<"\eOP", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f1} | Acc]);
+parse_input(<<"\eOQ", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f2} | Acc]);
+parse_input(<<"\eOR", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f3} | Acc]);
+parse_input(<<"\eOS", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f4} | Acc]);
+parse_input(<<"\e[15~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f5} | Acc]);
+parse_input(<<"\e[17~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f6} | Acc]);
+parse_input(<<"\e[18~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f7} | Acc]);
+parse_input(<<"\e[19~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f8} | Acc]);
+parse_input(<<"\e[20~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f9} | Acc]);
+parse_input(<<"\e[21~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f10} | Acc]);
+parse_input(<<"\e[23~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f11} | Acc]);
+parse_input(<<"\e[24~", Rest/binary>>, Acc) -> parse_input(Rest, [{key, f12} | Acc]);
+
 %% SGR Mouse events: \e[<button;col;rowM (press) or \e[<button;col;rowm (release)
 parse_input(<<"\e[<", Rest/binary>>, Acc) ->
     case parse_mouse_sgr(Rest) of
@@ -117,9 +132,25 @@ parse_input(<<"\e[<", Rest/binary>>, Acc) ->
             {lists:reverse(Acc), <<"\e[<", Rest/binary>>}
     end;
 
-%% Incomplete escape sequence - check if it looks like start of valid sequence
-parse_input(<<"\e[", Rest/binary>> = Buffer, Acc) when byte_size(Rest) < 2 ->
-    {lists:reverse(Acc), Buffer};
+%% Unknown or incomplete SS3 sequence (\eO...)
+parse_input(<<"\eO", Rest/binary>> = Buffer, Acc) ->
+    case classify_ss3(Rest) of
+        incomplete ->
+            {lists:reverse(Acc), Buffer};
+        {complete, Remaining} ->
+            %% Unknown SS3 sequence - consume and ignore it.
+            parse_input(Remaining, Acc)
+    end;
+
+%% Unknown or incomplete CSI sequence (\e[...)
+parse_input(<<"\e[", Rest/binary>> = Buffer, Acc) ->
+    case classify_csi(Rest) of
+        incomplete ->
+            {lists:reverse(Acc), Buffer};
+        {complete, Remaining} ->
+            %% Unknown CSI sequence - consume and ignore it.
+            parse_input(Remaining, Acc)
+    end;
 
 %% Standalone Escape key (no [ following, so not an escape sequence)
 parse_input(<<"\e", Rest/binary>>, Acc) when byte_size(Rest) == 0 ->
@@ -153,43 +184,75 @@ parse_input(<<_, Rest/binary>>, Acc) ->
 
 %% Parse SGR mouse format: button;col;rowM or button;col;rowm
 %% Button: 0=left, 1=middle, 2=right, 32+=motion, 64+=scroll
+%% Scroll directions: 64=up, 65=down, 66=left, 67=right
 parse_mouse_sgr(Data) ->
-    case binary:split(Data, [<<"M">>, <<"m">>]) of
-        [Params, Rest] ->
-            %% Determine if press or release based on terminator
-            IsPress = case binary:match(Data, <<"M">>) of
-                {Pos, _} ->
-                    case binary:match(Data, <<"m">>) of
-                        {Pos2, _} -> Pos < Pos2;
-                        nomatch -> true
-                    end;
-                nomatch -> false
-            end,
-            case binary:split(Params, <<";">>, [global]) of
-                [ButtonBin, ColBin, RowBin] ->
-                    try
-                        Button = binary_to_integer(ButtonBin),
-                        Col = binary_to_integer(ColBin),
-                        Row = binary_to_integer(RowBin),
-                        ButtonType = case Button band 3 of
-                            0 -> left;
-                            1 -> middle;
-                            2 -> right;
-                            3 -> release
-                        end,
-                        EventType = if
-                            Button >= 64 -> scroll;
-                            Button >= 32 -> motion;
-                            IsPress -> click;
-                            true -> release
-                        end,
-                        Event = {mouse, EventType, ButtonType, Col, Row},
-                        {ok, Event, Rest}
-                    catch
-                        _:_ -> incomplete
-                    end;
-                _ -> incomplete
-            end;
-        _ -> incomplete
-    end.
+    parse_sgr_params(Data, []).
 
+%% Accumulator-based scan: collect semicolon-separated numbers, then match terminator
+parse_sgr_params(<<>>, _Acc) ->
+    incomplete;
+parse_sgr_params(<<$;, Rest/binary>>, Acc) ->
+    parse_sgr_params(Rest, [0 | Acc]);
+parse_sgr_params(<<C, Rest/binary>>, Acc) when C >= $0, C =< $9 ->
+    parse_sgr_number(Rest, C - $0, Acc);
+parse_sgr_params(<<$M, Rest/binary>>, Acc) ->
+    finish_sgr(lists:reverse(Acc), true, Rest);
+parse_sgr_params(<<$m, Rest/binary>>, Acc) ->
+    finish_sgr(lists:reverse(Acc), false, Rest);
+parse_sgr_params(_, _Acc) ->
+    incomplete.
+
+parse_sgr_number(<<>>, _Num, _Acc) ->
+    incomplete;
+parse_sgr_number(<<C, Rest/binary>>, Num, Acc) when C >= $0, C =< $9 ->
+    parse_sgr_number(Rest, Num * 10 + (C - $0), Acc);
+parse_sgr_number(<<$;, Rest/binary>>, Num, Acc) ->
+    parse_sgr_params(Rest, [Num | Acc]);
+parse_sgr_number(<<$M, Rest/binary>>, Num, Acc) ->
+    finish_sgr(lists:reverse([Num | Acc]), true, Rest);
+parse_sgr_number(<<$m, Rest/binary>>, Num, Acc) ->
+    finish_sgr(lists:reverse([Num | Acc]), false, Rest);
+parse_sgr_number(_, _Num, _Acc) ->
+    incomplete.
+
+finish_sgr([Button, Col, Row], IsPress, Rest) ->
+    Event = mouse_event(Button, IsPress, Col, Row),
+    {ok, Event, Rest};
+finish_sgr(_, _, _) ->
+    incomplete.
+
+mouse_event(Button, _IsPress, Col, Row) when Button >= 64 ->
+    Direction = case Button band 3 of
+        0 -> up;
+        1 -> down;
+        2 -> left;
+        3 -> right
+    end,
+    {mouse, scroll, Direction, Col, Row};
+mouse_event(Button, IsPress, Col, Row) ->
+    ButtonType = case Button band 3 of
+        0 -> left;
+        1 -> middle;
+        2 -> right;
+        3 -> release
+    end,
+    EventType = if
+        Button >= 32 -> motion;
+        IsPress -> click;
+        true -> release
+    end,
+    {mouse, EventType, ButtonType, Col, Row}.
+
+classify_ss3(<<>>) ->
+    incomplete;
+classify_ss3(<<Final, Rest/binary>>) when Final >= 64, Final =< 126 ->
+    {complete, Rest};
+classify_ss3(_) ->
+    incomplete.
+
+classify_csi(<<>>) ->
+    incomplete;
+classify_csi(<<Final, Rest/binary>>) when Final >= 64, Final =< 126 ->
+    {complete, Rest};
+classify_csi(<<_, Rest/binary>>) ->
+    classify_csi(Rest).
